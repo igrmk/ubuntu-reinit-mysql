@@ -1,0 +1,147 @@
+#!/bin/bash
+
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root" 
+   exit 1
+fi
+
+# Start the server with networking disabled and socket in a temporary location
+# Usage: start_server <datadir> <tmpdir> <skip_grant>
+# Params:
+# datadir - Location of database files
+# tmpdir - Used to store temporary pid and socket files
+# skip_grant - If set, the server will be started with --skip-grant-tables
+start_server() {
+  local datadir=$1
+  local tmpdir=$2
+  local skip_grant=$3
+  # If a database is already running, mysqld will keep trying to lock the files for ~100 seconds before failing.
+  # If the ibdata1 file is locked we fail immediately
+  if fuser "$datadir/ibdata1"; then
+    echo "ERROR: Database files are locked. Daemon already running?" >&2
+    return 1
+  fi
+  # The --daemonize flag makes the process fork, with the original exiting once the database is ready for use
+  if [ ! -z "$skip_grant" ]; then
+    mysqld --user=mysql --daemonize --socket="$tmpdir/mysqld.sock" --pid-file="$tmpdir/mysqld.pid" --skip-networking --skip-grant-tables
+  else
+    mysqld --user=mysql --daemonize --socket="$tmpdir/mysqld.sock" --pid-file="$tmpdir/mysqld.pid" --skip-networking
+  fi
+}
+
+# Shut down the server by sending a kill signal to the process
+# Usage: stop_server <tmpdir>
+# Params:
+# tmpdir - Location of temporary pid-file
+stop_server(){
+  local tmpdir=$1
+  # Send kill signal
+  server_pid=$(cat "$tmpdir/mysqld.pid")
+  kill "$server_pid"
+
+  for i in $(seq 1 60); do
+    sleep 0.1 # A full second is too long, but we need to give the server _some_ time.
+    if ! $(ps $server_pid >/dev/null 2>&1); then
+      return 0
+    fi
+    sleep 1
+  done
+  # The server hasn't shut down in a timely manner
+  echo "Error: Unable to shut down server with process id $server_pid" >&2
+  return 1
+}
+
+# Runs an arbitrary init sql file supplied in $1. Does not require login access
+run_init_sql() {
+  tmpdir=`mktemp -d`
+  chown mysql:mysql "$tmpdir"
+  mysqld --user=mysql --init-file="$1" --socket="$tmpdir/mysqld.sock" --pid-file="$tmpdir/mysqld.pid"
+  result=$?
+  rm -rf "$tmpdir"
+  return $result
+}
+
+echo "Stopping mysql..."
+service mysql stop
+
+mysql_statedir=/var/lib/mysql
+mysql_rundir=/var/run/mysqld
+mysql_cfgdir=/etc/mysql
+mysql_filesdir=/var/lib/mysql-files
+
+echo "Removing data dirs..."
+rm -r $mysql_statedir $mysql_filesdir
+
+echo "Creating data dirs..."
+for d in $mysql_statedir $mysql_filesdir
+do
+  if [ ! -d "$d" -a ! -L "$d" ]; then mkdir "$d"; fi
+  chown -R mysql:mysql $d
+  chmod 0700 $d
+done
+
+echo "Creating default config..."
+dc=$mysql_cfgdir/debian.cnf; 
+pass=`perl -e 'print map{("a".."z","A".."Z",0..9)[int(rand(62))]}(1..16)'`;
+if [ ! -d "$mysql_cfgdir" ]; then install -o 0 -g 0 -m 0755 -d $mysql_cfgdir; fi
+umask 066
+cat /dev/null > $dc
+umask 022
+echo "# Automatically generated for Debian scripts. DO NOT TOUCH!" >>$dc
+echo "[client]"                                                    >>$dc
+echo "host     = localhost"                                        >>$dc
+echo "user     = debian-sys-maint"                                 >>$dc
+echo "password = $pass"                                            >>$dc
+echo "socket   = $mysql_rundir/mysqld.sock"                        >>$dc
+echo "[mysql_upgrade]"                                             >>$dc
+echo "host     = localhost"                                        >>$dc
+echo "user     = debian-sys-maint"                                 >>$dc
+echo "password = $pass"                                            >>$dc
+echo "socket   = $mysql_rundir/mysqld.sock"                        >>$dc
+# If this dir chmod go+w then the admin did it. But this file should not.
+chown 0:0 $dc
+chmod 0600 $dc
+
+echo "Initializing database..."
+initfile=`mktemp --tmpdir=/var/lib/mysql-files/`
+touch "$initfile"
+chmod 600 "$initfile"
+chown mysql:mysql "$initfile"
+echo "USE mysql; " >> "$initfile"
+echo "CREATE USER 'debian-sys-maint'@'localhost' IDENTIFIED BY '$pass';" >> "$initfile"
+echo "GRANT ALL ON *.* TO 'debian-sys-maint'@'localhost' WITH GRANT OPTION;" >> "$initfile"
+echo "SHUTDOWN;" >> "$initfile"
+# mysqld returns an error instead of a warning if CREATE USER IF NOT
+# EXISTS fails, so ignore errors as a workaround. See:
+# http://bugs.mysql.com/bug.php?id=80636
+mysqld --initialize-insecure --user=mysql --init-file="$initfile"
+rm "$initfile"
+
+# To avoid downgrades. This has to happen after the database is created, or --initialize will fail
+touch $mysql_statedir/debian-5.7.flag
+
+echo "Starting mysql..."
+tmpdir=$(mktemp -d)
+chown mysql:mysql "$tmpdir"
+start_server "$mysql_statedir" "$tmpdir"
+
+echo "Installing auth_socket plugin..."
+pluginfile=`mktemp --tmpdir=/var/lib/mysql-files/`
+echo "INSTALL PLUGIN auth_socket SONAME 'auth_socket.so';" >> "$pluginfile"
+mysql --no-defaults --socket="$tmpdir/mysqld.sock" -uroot < "$pluginfile"
+rm "$pluginfile"
+
+echo "Stopping mysql..."
+stop_server "$tmpdir"
+
+echo "Updating root user..."
+initfile=`mktemp --tmpdir=/var/lib/mysql-files/`
+chown mysql:mysql "$initfile"
+echo "USE mysql;" >> "$initfile"
+echo "ALTER USER 'root'@'localhost' IDENTIFIED WITH 'auth_socket';" >> "$initfile"
+echo "SHUTDOWN;" >> "$initfile"
+run_init_sql "$initfile"
+rm "$initfile"
+
+echo "Starting mysql..."
+service mysql start
