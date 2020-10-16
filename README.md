@@ -8,8 +8,8 @@ However it is not that easy in Ubuntu because post-installation script performs 
 You will lose them if you reinit data directory by yourself.
 This script reinits data directory and performs same steps:
 
-* Create special maintenance user used by OS on upgrading
-* Set up UNIX socket authentication so that you can write `sudo mysql` and connect to database as root
+* Creates a special maintenance user used by an OS on upgrading
+* Sets up UNIX socket authentication so that you can write `sudo mysql` and connect to database as root
 
 Usage
 -----
