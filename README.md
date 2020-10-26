@@ -1,5 +1,5 @@
-reinit-mysql-data
-=================
+ubuntu-reinit-mysql
+===================
 
 WARNING! THIS SCRIPT WILL REMOVE ALL YOUR MYSQL DATA!
 
